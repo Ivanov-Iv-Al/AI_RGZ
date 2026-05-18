@@ -3,11 +3,32 @@ import pandas as pd
 import os
 import glob
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.metrics import average_precision_score, f1_score, precision_recall_curve, confusion_matrix
 import xgboost as xgb
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+
+def detect_outliers_iqr(data, multiplier=1.5):
+    Q1 = np.percentile(data, 25)
+    Q3 = np.percentile(data, 75)
+    IQR = Q3 - Q1
+    lower_bound = Q1 - multiplier * IQR
+    upper_bound = Q3 + multiplier * IQR
+    return (data < lower_bound) | (data > upper_bound)
+
+
+def detect_outliers_zscore(data, threshold=3):
+    z_scores = np.abs((data - np.mean(data)) / np.std(data))
+    return z_scores > threshold
+
+
+def cap_outliers(data, lower_percentile=1, upper_percentile=99):
+    lower = np.percentile(data, lower_percentile)
+    upper = np.percentile(data, upper_percentile)
+    return np.clip(data, lower, upper)
+
 
 all_dfs = []
 for scenario in ['Indoor', 'Mobility', 'Outdoor', 'Pedestrian']:
@@ -34,15 +55,37 @@ events_data['is_buffer'] = (events_data['Status'] == 3).astype(int)
 common_eids = set(channel_data['Eid'].unique()) & set(events_data['Eid'].unique())
 print(f"Общих Eid: {len(common_eids)}")
 
-history_window = 20
+history_window = 10
 future_window = 10
 
 features_list = []
 targets_list = []
 
+outlier_stats = {}
+
 for eid in common_eids:
     channel_eid = channel_data[channel_data['Eid'] == eid].sort_values('Timestamp')
     channel_eid = channel_eid.ffill().bfill()
+
+    for col in ['RSRP', 'RSRQ', 'CQI', 'SNR', 'DL_bitrate', 'UL_bitrate']:
+        if col in channel_eid.columns:
+            col_data = channel_eid[col].values
+            col_data = col_data[~np.isnan(col_data)]
+
+            outliers_iqr = detect_outliers_iqr(col_data)
+            outliers_zscore = detect_outliers_zscore(col_data)
+            outliers_combined = outliers_iqr | outliers_zscore
+
+            outlier_stats[f'{eid}_{col}'] = {
+                'total': len(col_data),
+                'outliers_iqr': np.sum(outliers_iqr),
+                'outliers_zscore': np.sum(outliers_zscore),
+                'outliers_combined': np.sum(outliers_combined),
+                'outlier_percent': np.sum(outliers_combined) / len(col_data) * 100
+            }
+
+            col_data_capped = cap_outliers(col_data)
+            channel_eid[col] = col_data_capped
 
     events_eid = events_data[events_data['Eid'] == eid].sort_values('TimeStall')
     events_eid['time'] = pd.to_numeric(events_eid['TimeStall'], errors='coerce')
@@ -74,17 +117,32 @@ for eid in common_eids:
                     row[f'{col}_min'] = np.min(col_data)
                     row[f'{col}_max'] = np.max(col_data)
                     row[f'{col}_trend'] = np.polyfit(range(len(col_data)), col_data, 1)[0] if len(col_data) > 1 else 0
+                    row[f'{col}_outlier_ratio'] = np.sum(detect_outliers_iqr(col_data)) / len(col_data)
 
         if row:
             features_list.append(row)
             targets_list.append(future_buffering)
 
+print(f"\nСтатистика выбросов:")
+outlier_df = pd.DataFrame(outlier_stats).T
+print(f"Средний процент выбросов: {outlier_df['outlier_percent'].mean():.2f}%")
+print(f"Макс процент выбросов: {outlier_df['outlier_percent'].max():.2f}%")
+
 X_raw = pd.DataFrame(features_list)
 y = np.array(targets_list)
 
-print(f"Создано {len(X_raw)} посекундных примеров")
+print(f"\nСоздано {len(X_raw)} посекундных примеров")
 print(f"Распределение: 0={np.sum(y == 0)}, 1={np.sum(y == 1)}")
 print(f"Доля буферизации: {np.mean(y) * 100:.2f}%")
+
+for col in X_raw.columns:
+    if 'outlier_ratio' in col:
+        outliers_col = X_raw[col].values
+        outliers_mask = outliers_col > 0.3
+        if np.sum(outliers_mask) > 0:
+            print(f"Удалено {np.sum(outliers_mask)} записей с {col} > 0.3")
+            X_raw = X_raw[~outliers_mask]
+            y = y[~outliers_mask]
 
 X_raw = X_raw.fillna(0)
 
@@ -92,7 +150,11 @@ constant_cols = [col for col in X_raw.columns if X_raw[col].std() == 0]
 X_raw = X_raw.drop(columns=constant_cols)
 print(f"Признаков после обработки: {X_raw.shape[1]}")
 
-scaler = StandardScaler()
+for col in X_raw.columns:
+    if 'std' in col or 'trend' in col:
+        X_raw[col] = cap_outliers(X_raw[col].values, lower_percentile=5, upper_percentile=95)
+
+scaler = RobustScaler()
 X_scaled = scaler.fit_transform(X_raw)
 
 X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42, stratify=y)
@@ -108,7 +170,9 @@ model = xgb.XGBClassifier(
     learning_rate=0.1,
     scale_pos_weight=ratio,
     random_state=42,
-    eval_metric='logloss'
+    eval_metric='logloss',
+    reg_alpha=0.1,
+    reg_lambda=1.0
 )
 
 model.fit(X_train, y_train)
@@ -151,7 +215,7 @@ print(importance.head(10))
 plt.figure(figsize=(10, 6))
 plt.barh(importance['feature'].head(10), importance['importance'].head(10))
 plt.xlabel('Важность')
-plt.title('Топ-10 важных признаков')
+plt.title('Топ-10 важных признаков (с обработкой выбросов)')
 plt.gca().invert_yaxis()
 plt.tight_layout()
 plt.show()
