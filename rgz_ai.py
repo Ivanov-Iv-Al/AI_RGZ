@@ -4,8 +4,10 @@ import os
 import glob
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import RobustScaler
-from sklearn.metrics import average_precision_score, f1_score
+from sklearn.metrics import average_precision_score, f1_score, precision_recall_curve, confusion_matrix
 import xgboost as xgb
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 all_dfs = []
 for scenario in ['Indoor', 'Mobility', 'Outdoor', 'Pedestrian']:
@@ -61,7 +63,7 @@ else:
 common_eids = set(channel_data['Eid'].unique()) & set(events_data['Eid'].unique())
 
 if len(common_eids) == 0:
-    raise ValueError("Нет общих сессий Eid между логами радиоканала и логами событий!")
+    raise ValueError("Нет общих сессий Eid между логами радиоканала и логами событий")
 
 history_seconds = 25
 future_seconds = 10
@@ -138,12 +140,14 @@ y = np.array(targets_list)
 
 print(f"Создано {len(X_raw)} примеров (0={np.sum(y == 0)}, 1={np.sum(y == 1)})")
 if X_raw.empty:
-    raise ValueError("DataFrame признаков пуст")
+    raise ValueError("DataFrame признаков пуст!")
 
 X_raw = X_raw.fillna(0)
 
 constant_cols = [col for col in X_raw.columns if X_raw[col].std() == 0]
 X_raw = X_raw.drop(columns=constant_cols)
+
+feature_names = X_raw.columns.tolist()
 
 scaler = RobustScaler()
 X_scaled = scaler.fit_transform(X_raw)
@@ -184,3 +188,36 @@ f1 = f1_score(y_test, y_pred)
 print(f"PR-AUC: {pr_auc:.4f}")
 print(f"F1-score: {f1:.4f}")
 print(f"Оптимальный порог: {best_threshold:.3f}")
+
+cm = confusion_matrix(y_test, y_pred)
+
+plt.figure(figsize=(18, 5))
+
+plt.subplot(1, 3, 1)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False,
+            xticklabels=['Нет буф.', 'Буферизация'], yticklabels=['Нет буф.', 'Буферизация'])
+plt.title(f'Матрица ошибок (Порог: {best_threshold:.2f})')
+plt.xlabel('Предсказано моделью')
+plt.ylabel('Реальный факт')
+
+plt.subplot(1, 3, 2)
+precision, recall, _ = precision_recall_curve(y_test, y_test_proba)
+plt.plot(recall, precision, color='darkorange', lw=2, label=f'PR-кривая (AUC = {pr_auc:.4f})')
+plt.xlabel('Полнота (Recall)')
+plt.ylabel('Точность (Precision)')
+plt.title('Precision-Recall Кривая')
+plt.legend(loc="lower left")
+plt.grid(True)
+
+plt.subplot(1, 3, 3)
+importances = model.feature_importances_
+indices = np.argsort(importances)[::-1][:15]
+top_features = [feature_names[i] for i in indices]
+top_importances = importances[indices]
+
+sns.barplot(x=top_importances, y=top_features, hue=top_features, palette='viridis', legend=False)
+plt.title('Топ-15 значимых признаков')
+plt.xlabel('Относительная важность')
+
+plt.tight_layout()
+plt.show()
